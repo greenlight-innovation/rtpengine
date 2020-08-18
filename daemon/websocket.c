@@ -99,6 +99,39 @@ INLINE int websocket_write_binary(struct websocket_conn *wc, const char *msg, si
 }
 
 
+static const char *websocket_janus_process(struct websocket_conn *wc, struct websocket_message *wm) {
+	JsonParser *parser = NULL;
+	JsonReader *reader = NULL;
+	const char *err;
+
+	ilog(LOG_DEBUG, "Processing Janus message: '%.*s'", (int) wm->body->len, wm->body->str);
+
+	parser = json_parser_new();
+	err = "Failed to parse JSON";
+	if (!json_parser_load_from_data(parser, wm->body->str, wm->body->len, NULL))
+		goto err;
+	reader = json_reader_new(json_parser_get_root(parser));
+	if (!reader)
+		goto err;
+	err = "JSON string is not an object";
+	if (!json_reader_is_object(reader))
+		goto err;
+	err = "JSON object does not contain 'janus' key";
+	if (!json_reader_read_member(reader, "janus"))
+		goto err;
+
+	json_reader_end_member(reader);
+
+	err = NULL;
+err:
+	if (reader)
+		g_object_unref(reader);
+	if (parser)
+		g_object_unref(parser);
+	return err;
+}
+
+
 static const char *websocket_echo_process(struct websocket_conn *wc, struct websocket_message *wm) {
 	ilog(LOG_DEBUG, "Returning %lu bytes websocket echo", wm->body->len);
 	websocket_write_binary(wc, wm->body->str, wm->body->len);
@@ -248,6 +281,16 @@ static int websocket_http_post(struct websocket_conn *wc) {
 }
 
 
+static int websocket_admin_post(struct websocket_conn *wc) {
+	if (wc->wm->content_type != CT_JSON) {
+		ilog(LOG_WARN, "Unsupported content-type on admin POST");
+		return -1;
+	}
+	websocket_message_push(wc, websocket_janus_process);
+	return 0;
+}
+
+
 static int websocket_http_body(struct websocket_conn *wc, const char *body, size_t len) {
 	struct websocket_message *wm = wc->wm;
 
@@ -263,6 +306,9 @@ static int websocket_http_body(struct websocket_conn *wc, const char *body, size
 	}
 
 	ilog(LOG_DEBUG, "HTTP body complete: '%.*s'", (int) wm->body->len, wm->body->str);
+
+	if (!strcmp(wm->uri, "/admin") && wm->method == M_POST)
+		return websocket_admin_post(wc);
 
 	ilog(LOG_WARN, "Unhandled HTTP POST URI: '%s'", wm->uri);
 	return -1;
@@ -436,6 +482,11 @@ static int websocket_protocol(struct lws *wsi, enum lws_callback_reasons reason,
 }
 
 
+static int websocket_janus(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in,
+		size_t len)
+{
+	return websocket_protocol(wsi, reason, user, in, len, websocket_janus_process, "janus-protocol");
+}
 static int websocket_rtpengine_echo(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in,
 		size_t len)
 {
@@ -447,6 +498,11 @@ static const struct lws_protocols websocket_protocols[] = {
 	{
 		.name = "http-only",
 		.callback = websocket_http,
+		.per_session_data_size = sizeof(struct websocket_conn),
+	},
+	{
+		.name = "janus-protocol",
+		.callback = websocket_janus,
 		.per_session_data_size = sizeof(struct websocket_conn),
 	},
 	{
